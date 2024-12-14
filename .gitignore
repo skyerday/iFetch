@@ -2,3 +2,6 @@ LocalDoc/
 venv/
 .env
 .ropeproject
+__pycache__
+.idea/
+.vscode/
