@@ -1,0 +1,4 @@
+LocalDoc/
+venv/
+.env
+.ropeproject
