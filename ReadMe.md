@@ -57,7 +57,7 @@ The tool will prompt for your password and store it securely in your system's ke
 ### List Directory Contents
 View the contents of an iCloud Drive directory:
 ```sh
-python main.py "Documents" --list
+python main.py Documents --list
 ```
 
 ### Download Files/Folders
