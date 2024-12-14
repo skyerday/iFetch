@@ -12,6 +12,65 @@ from pyicloud.exceptions import (
     PyiCloudNoStoredPasswordAvailableException
 )
 
+def can_read_file(item) -> bool:
+    """Check if the item is a readable file by attempting to open it."""
+    # Debug info
+    print(f"Checking item: {getattr(item, 'name', 'unknown')}")
+    print(f"Item attributes: {dir(item)}")
+
+    if not hasattr(item, 'open'):
+        print("No 'open' attribute")
+        return False
+
+    if hasattr(item, 'type'):
+        item_type = getattr(item, 'type', '').lower()
+        print(f"Item type: {item_type}")
+        if item_type == 'folder':
+            return False
+
+    try:
+        with item.open(stream=True) as response:
+            if not response.ok:
+                print(f"Response not OK: {response.status_code}")
+                return False
+            # Try to read a small chunk to verify it's a readable file
+            chunk = next(response.raw.stream(1024, decode_content=False), None)
+            has_content = chunk is not None
+            print(f"Has content: {has_content}")
+            return has_content
+    except Exception as e:
+        print(f"Error reading file: {str(e)}")
+        return False
+
+def process_item(self, item, local_path: Path) -> None:
+    """Process an item, determining whether to treat it as a file or directory."""
+    try:
+        item_name = getattr(item, 'name', 'unknown')
+        print(f"\nProcessing item: {item_name}")
+
+        # If it has a type attribute and it's a folder, process as directory
+        if hasattr(item, 'type') and getattr(item, 'type', '').lower() == 'folder':
+            print(f"Processing as directory: {item_name}")
+            if hasattr(item, 'dir'):
+                contents = item.dir()
+                if contents:
+                    local_path.mkdir(exist_ok=True)
+                    for name in contents:
+                        sub_item = item[name]
+                        sub_path = local_path / name
+                        self.process_item(sub_item, sub_path)
+        elif can_read_file(item):
+            print(f"Processing as file: {item_name}")
+            if self.download_drive_item(item, local_path):
+                tqdm.write(f"Successfully downloaded: {item_name}")
+            else:
+                print(f"Failed to download: {item_name}")
+        else:
+            print(f"Skipping unprocessable item: {item_name}")
+
+    except Exception as e:
+        print(f"Error processing {getattr(item, 'name', 'unknown')}: {str(e)}")
+
 class iFetch:
     def __init__(self, email: Optional[str] = None):
         """Initialize the downloader with user's iCloud email."""
@@ -102,7 +161,9 @@ class iFetch:
 
                 print(f"\nContents of {path or '/'}: ")
                 for name in contents:
-                    print(f"- {name}")
+                    sub_item = item[name]
+                    is_file = can_read_file(sub_item)
+                    print(f"- {name}{'' if is_file else '/'}")
             else:
                 print(f"'{path}' is a file")
         except Exception as e:
@@ -111,9 +172,12 @@ class iFetch:
     def download_drive_item(self, item, local_path: Path) -> bool:
         """Download a single file from iCloud Drive."""
         if not hasattr(item, 'name') or not hasattr(item, 'open'):
-            raise Exception("Invalid item type")
+            return False
 
         try:
+            # Create parent directory if it doesn't exist
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+
             with item.open(stream=True) as response:
                 total_size = int(response.headers.get('content-length', 0))
 
@@ -130,41 +194,30 @@ class iFetch:
                             pbar.update(len(chunk))
             return True
         except Exception as e:
-            print(f"Error downloading {getattr(item, 'name', 'unknown')}: {str(e)}")
+            if local_path.exists() and local_path.stat().st_size == 0:
+                local_path.unlink()  # Remove empty file
             return False
 
-    def download_directory(self, item, local_base_path: Path) -> None:
-        """Recursively download a directory."""
-        if not hasattr(item, 'dir'):
-            raise Exception("Item is not a directory")
-
+    def process_item(self, item, local_path: Path) -> None:
+        """Process an item, determining whether to treat it as a file or directory."""
         try:
-            contents = item.dir()
-            if not contents:
-                print(f"Directory '{getattr(item, 'name', 'unknown')}' is empty")
-                return
-
-            for name in contents:
-                try:
-                    sub_item = item[name]
-                    sub_path = local_base_path / name
-
-                    if hasattr(sub_item, 'dir'):  # It's a directory
-                        sub_path.mkdir(exist_ok=True)
-                        self.download_directory(sub_item, sub_path)
-                    else:  # It's a file
-                        if sub_path.exists() and hasattr(sub_item, 'size') and sub_path.stat().st_size == sub_item.size:
-                            tqdm.write(f"Skipping existing file: {name}")
-                            continue
-
-                        self.download_drive_item(sub_item, sub_path)
-
-                except Exception as e:
-                    print(f"Error processing {name}: {str(e)}")
-                    continue
-
+            if can_read_file(item):
+                # It's a readable file, download it
+                if self.download_drive_item(item, local_path):
+                    tqdm.write(f"Successfully downloaded: {item.name}")
+                else:
+                    print(f"Failed to download: {item.name}")
+            elif hasattr(item, 'dir'):
+                # Try to process as directory
+                contents = item.dir()
+                if contents:
+                    local_path.mkdir(exist_ok=True)
+                    for name in contents:
+                        sub_item = item[name]
+                        sub_path = local_path / name
+                        self.process_item(sub_item, sub_path)
         except Exception as e:
-            print(f"Error processing directory {getattr(item, 'name', 'unknown')}: {str(e)}")
+            print(f"Error processing {getattr(item, 'name', 'unknown')}: {str(e)}")
 
     def download(self, icloud_path: str, local_path: str = '.') -> None:
         """Download files/folders from iCloud Drive to local directory."""
@@ -175,25 +228,14 @@ class iFetch:
             raise Exception("iCloud Drive service not available")
 
         try:
-            # Create local directory
-            local_path = Path(local_path)
-            local_path.mkdir(parents=True, exist_ok=True)
+            # Convert to Path object
+            local_path = Path(local_path).resolve()
 
             # Get the item from iCloud Drive
             item = self.get_drive_item(icloud_path)
 
-            # If it's a directory, download recursively
-            if hasattr(item, 'dir'):
-                print(f"Downloading directory: {icloud_path}")
-                self.download_directory(item, local_path)
-            else:
-                # It's a single file
-                local_file_path = local_path / item.name
-                if local_file_path.exists() and local_file_path.stat().st_size == item.size:
-                    print(f"Skipping existing file: {item.name}")
-                else:
-                    self.download_drive_item(item, local_file_path)
-
+            print(f"Processing: {icloud_path}")
+            self.process_item(item, local_path)
             print("\nDownload completed successfully!")
 
         except Exception as e:
