@@ -3,6 +3,7 @@ import time
 import shutil
 import json
 import threading
+import sys  # Added import
 from pathlib import Path
 from typing import Optional, List, Set, Dict, Any, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -116,24 +117,44 @@ class DownloadManager:
                 sha256.update(chunk)
         return sha256.hexdigest()
 
-    def download_chunk(self, url: str, start: int, end: int) -> bytes:
-        """Download a specific byte range with retries and backoff."""
+    def _stream_download_range(self, url: str, start: int, end: int, out_file: Any, pbar: Any) -> None:
+        """Streams a specific byte range to the out_file, updating pbar."""
         headers = {'Range': f'bytes={start}-{end}'}
         retries = 0
         last_error = None
+        stream_chunk_size = 1024 * 1024
 
         while retries < self.max_retries:
+            resp = None
             try:
-                resp = requests.get(url, headers=headers, stream=True, timeout=30)
-                resp.raise_for_status()  # Raise error for non-200/206 status codes
+                resp = requests.get(url, headers=headers, stream=True, timeout=60)
+                resp.raise_for_status()
                 if resp.status_code in (200, 206):
-                    return resp.content
+                    out_file.seek(start)
+                    for data_chunk in resp.iter_content(chunk_size=stream_chunk_size):
+                        if data_chunk:
+                            out_file.write(data_chunk)
+                            pbar.update(len(data_chunk))
+                    return
+                else:
+                    last_error = requests.RequestException(f"Unexpected status code {resp.status_code} for range request")
+
             except requests.RequestException as e:
                 last_error = e
-                retries += 1
-                time.sleep(2 ** retries)  # Exponential backoff
+            finally:
+                if resp:
+                    resp.close()
 
-        raise Exception(f"Failed to download chunk {start}-{end} after {self.max_retries} retries: {last_error}")
+            retries += 1
+            self.logger.warning(
+                f"Retrying download for range {start}-{end} (size {end-start+1} bytes), "
+                f"attempt {retries}/{self.max_retries}. Error: {last_error}"
+            )
+            time.sleep(2 ** retries)
+
+        raise Exception(
+            f"Failed to download range {start}-{end} after {self.max_retries} retries: {last_error}"
+        )
 
     def download_drive_item(self, item: Any, local_path: Path) -> bool:
         """Download file with differential updates support and checkpointing."""
@@ -147,6 +168,7 @@ class DownloadManager:
         tracker = DownloadTracker(local_path)
         temp_path: Optional[Path] = None
         total_size = 0
+        final_checksum = ""
 
         try:
             with item.open(stream=True) as response:
@@ -160,45 +182,68 @@ class DownloadManager:
                         "file": item.name,
                         "path": str(local_path)
                     }))
+                    if local_path.exists() and local_path.stat().st_size > 0:
+                        final_checksum = self.calculate_checksum(local_path)
+
+                    self.download_results.append(DownloadStatus(
+                        path=str(local_path),
+                        size=total_size,
+                        downloaded=0,
+                        checksum=final_checksum,
+                        status="completed",
+                        changes=0
+                    ))
+                    tracker.cleanup()
                     return True
 
                 bytes_to_download = sum(end - start + 1 for start, end in changed_ranges)
                 temp_path = local_path.with_suffix(local_path.suffix + '.temp')
 
-                # Create parent directories if they don't exist
                 local_path.parent.mkdir(parents=True, exist_ok=True)
 
                 if local_path.exists():
                     shutil.copy2(local_path, temp_path)
                 else:
-                    # Initialize the temp file with zeros
                     with temp_path.open('wb') as f:
-                        f.seek(total_size - 1)
-                        f.write(b'\0')
+                        if total_size > 0:
+                            f.seek(total_size - 1)
+                            f.write(b'\0')
 
                 with temp_path.open('r+b') as out_file, tqdm(
                     desc=f"Updating {item.name}",
                     total=bytes_to_download,
                     unit='B',
                     unit_scale=True,
-                    unit_divisor=1024
+                    unit_divisor=1024,
+                    disable=not sys.stdout.isatty()
                 ) as pbar:
+                    changed_ranges.sort(key=lambda r: r[0])
+
                     for start, end in changed_ranges:
-                        chunk = self.download_chunk(response.url, start, end)
-                        out_file.seek(start)
-                        out_file.write(chunk)
-                        pbar.update(len(chunk))
+                        self._stream_download_range(response.url, start, end, out_file, pbar)
                         tracker.save_status(end + 1)
 
-                # Only calculate checksum if temp_path exists and has content
-                if temp_path.exists() and temp_path.stat().st_size > 0:
-                    temp_checksum = self.calculate_checksum(temp_path)
-                    temp_path.replace(local_path)
+                if not temp_path.exists() or (total_size > 0 and temp_path.stat().st_size == 0):
+                    self.logger.error(json.dumps({
+                        "event": "invalid_temp_file_after_download",
+                        "file": item.name,
+                        "path": str(temp_path),
+                        "error": "Temporary file is empty or doesn't exist when it shouldn't be."
+                    }))
+                    return False
+
+                temp_path.replace(local_path)
+
+                if local_path.exists() and local_path.stat().st_size > 0:
+                    final_checksum = self.calculate_checksum(local_path)
+                elif total_size == 0 and local_path.exists() and local_path.stat().st_size == 0:
+                    final_checksum = self.calculate_checksum(local_path)
                 else:
                     self.logger.error(json.dumps({
-                        "event": "invalid_temp_file",
+                        "event": "final_file_issue_after_replace",
                         "file": item.name,
-                        "error": "Temporary file is empty or doesn't exist"
+                        "path": str(local_path),
+                        "error": "Final file is missing or empty unexpectedly after replace."
                     }))
                     return False
 
@@ -206,7 +251,7 @@ class DownloadManager:
                     path=str(local_path),
                     size=total_size,
                     downloaded=bytes_to_download,
-                    checksum=temp_checksum,
+                    checksum=final_checksum,
                     status="completed",
                     changes=len(changed_ranges)
                 ))
@@ -217,6 +262,7 @@ class DownloadManager:
             self.logger.error(json.dumps({
                 "event": "download_failed",
                 "file": getattr(item, 'name', 'unknown'),
+                "path": str(local_path),
                 "error": str(e)
             }))
             if temp_path and temp_path.exists():
@@ -224,7 +270,9 @@ class DownloadManager:
                     temp_path.unlink()
                 except OSError as unlink_error:
                     self.logger.error(json.dumps({
-                        "event": "temp_file_cleanup_error",
+                        "event": "temp_file_cleanup_error_on_failure",
+                        "file": getattr(item, 'name', 'unknown'),
+                        "path": str(temp_path),
                         "error": str(unlink_error)
                     }))
 
@@ -232,7 +280,7 @@ class DownloadManager:
                 path=str(local_path),
                 size=total_size,
                 downloaded=0,
-                checksum="",  # Empty string instead of None
+                checksum="",
                 status="failed",
                 error=str(e)
             ))
@@ -275,7 +323,6 @@ class DownloadManager:
                             for name in contents
                         ]
                         for future in as_completed(futures):
-                            # Retrieve result or exception
                             try:
                                 future.result()
                             except Exception as e:
@@ -349,7 +396,6 @@ class DownloadManager:
         if not self.api or not self.api.drive:
             raise Exception("iCloud Drive service not available")
 
-        # Convert local_path to Path if it's a string
         local_path_obj = Path(local_path).resolve()
         item = self.get_drive_item(icloud_path)
 
@@ -366,7 +412,6 @@ class DownloadManager:
         report = self.generate_summary_report()
         self.logger.info(json.dumps({"event": "download_completed", "summary": report}))
 
-        # Create report file in the same location as downloads
         report_path = local_path_obj / "download_report.json"
         with report_path.open('w') as f:
             json.dump(report, f, indent=2)
